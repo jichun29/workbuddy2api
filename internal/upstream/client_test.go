@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,6 +25,8 @@ func TestClassify(t *testing.T) {
 		{402, ``, ErrHardCredit},
 		{400, `{"code":1,"msg":"余额不足"}`, ErrHardCredit},
 		{403, `insufficient credits`, ErrHardCredit},
+		{403, `credits exhausted`, ErrHardCredit},
+		{200, `{"code":1,"msg":"credits exhausted, please top up"}`, ErrHardCredit},
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
@@ -50,6 +53,15 @@ func TestClassify(t *testing.T) {
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
 		{200, `quota exceeded`, ErrHardCredit},
+		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
+		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前
+		// 11140 走 4xx → ErrClient 只换号不罚，坏号留在池内被反复选中刷风控。
+		// 注意：11140 不按 code 单独判定——该 code 也承载 rate-limiting 软限流文案
+		// （上方 {200, "code":11140 rate-limiting} 必须仍是 ErrSoftRate），只能靠 msg 区分。
+		{403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		{403, `request illegal`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated. Please log out of your current account and log in again to activate it immediately and start your free trial."}}}`, ErrAccountFault},
+		{400, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
@@ -58,10 +70,47 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
+		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
+		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
+		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestContentBlockedClientMessage 内容拦截把上游 body 改写成防火墙口径：
+// 括号填分类关键词（由 body 抽出，抽不到回「违禁词」），绝不泄露上游 code/账号/upstream 字样。
+func TestContentBlockedClientMessage(t *testing.T) {
+	cases := []struct {
+		body    string
+		keyword string
+	}{
+		{`{"code":11128,"msg":"blocked by security policy"}`, "违禁词"},
+		{`{"code":"11128","msg":"blocked by security policy"}`, "违禁词"},
+		{`Illegal API invocation from an unapproved channel`, "违禁词"},
+		{`{"code":11128,"msg":"content contains NSFW material"}`, "nsfw"},
+		{`{"msg":"命中色情内容"}`, "色情"},
+		{`violence detected`, "violence"},
+		{"", "违禁词"},
+	}
+	for _, c := range cases {
+		got := ContentBlockedClientMessage(c.body)
+		want := fmt.Sprintf("触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。", c.keyword)
+		if got != want {
+			t.Errorf("ContentBlockedClientMessage(%q)=\n%q\nwant %q", c.body, got, want)
+		}
+		for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
+			if strings.Contains(strings.ToLower(got), leak) {
+				t.Errorf("client message must not leak %q: %s", leak, got)
+			}
 		}
 	}
 }
@@ -86,8 +135,44 @@ func TestIsModelRateLimit(t *testing.T) {
 	}
 }
 
-// TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
-func TestParseSoftRateReset(t *testing.T) {
+// TestIsModelBlocked 11102「该后端无此模型」判定：只认 code 精确等于 11102 或 msg 命中
+// 窄短语 "service info not found"，且仅在 400/404 下判。覆盖 reference 报告「11102 撞在
+// ID 上」的坑——requestId 里的 11102 不得误判。
+func TestIsModelBlocked(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		// 顶层 code 字段。
+		{404, `{"code":11102,"msg":"model [x] service info not found"}`, true},
+		// error 子对象 code 字段（OpenAI 信封形态）。
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, true},
+		// msg 短语命中（无 code 字段）。
+		{400, `{"msg":"model service info not found"}`, true},
+		// 11102 撞在 requestId 上不算（reference converter test_model_site_blocks.py:55 同款）。
+		{404, `{"requestId":"11102","code":0,"msg":"ok"}`, false},
+		{400, `{"requestId":"11102","msg":"boom"}`, false},
+		// 429 带 11102 属限流语义，不算模型不存在。
+		{429, `{"code":11102,"msg":"service info not found"}`, false},
+		// 非 400/404 不算。
+		{500, `{"code":11102,"msg":"service info not found"}`, false},
+		// code 非 11102 且无短语 → 不算。
+		{404, `{"code":11103,"msg":"x"}`, false},
+		// 空 body 不算。
+		{404, ``, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBlocked(c.status, c.body); got != c.want {
+			t.Errorf("IsModelBlocked(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestParseRateReset 统一解析任意限流响应（6004 **和** 非 6004，如 11140 rate-limiting）
+// msg 里的「将在 … 重置」时间（UTC+8）。旧语义（非 6004 带时间 → false）是有意推翻的：
+// 11140 的 rate-limiting 变体带重置时间时同样应被精确对齐到上游重置墙钟。
+func TestParseRateReset(t *testing.T) {
 	future := time.Now().Add(35 * time.Minute)
 	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
 	cases := []struct {
@@ -97,14 +182,14 @@ func TestParseSoftRateReset(t *testing.T) {
 	}{
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"11140 rate-limiting 带时间(账号级也应对齐)", `{"code":11140,"msg":"The model provider is rate-limiting requests. 将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseSoftRateReset(c.body)
+			got, ok := ParseRateReset(c.body)
 			if ok != c.ok {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
 			}
@@ -219,7 +304,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -227,7 +312,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -239,7 +324,10 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	var outbound []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"),
+			strings.HasSuffix(r.URL.Path, "/v3/config"):
+			// v3-config-merge：FetchModels 并发打 console + /v3/config 两路，同一份
+			// glm-5.2 模型表（v3 主条目进 effort 桶，口径不变）。
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
@@ -266,7 +354,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -285,7 +373,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`))
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -324,7 +412,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -340,6 +428,91 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	}
 	if strings.Contains(got, "context canceled") {
 		t.Fatalf("body read hit context canceled, got %q", got)
+	}
+}
+
+// TestResourceSummaryAggregation 断言 ResourceSummary 聚合口径：
+// remain 取 Cycle 期剩余、size 取 CycleSize（TotalDosage 作 size 下限）、used 派生。
+func TestResourceSummaryAggregation(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"TotalDosage":3000,"Accounts":[
+			{"PackageName":"签到包","CapacitySize":2000,"CapacityRemain":1200,"CapacityUsed":800,"CycleCapacitySize":2000,"CycleCapacityRemain":1200,"CycleCapacityUsed":800},
+			{"PackageName":"体验包","CapacitySize":1000,"CapacityRemain":300,"CapacityUsed":700,"CycleCapacitySize":1000,"CycleCapacityRemain":300,"CycleCapacityUsed":700}
+		]}}}}`), nil
+	})
+	remain, used, size, packs, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if remain != 1500 || size != 3000 {
+		t.Errorf("summary remain=%d size=%d want 1500/3000 (TotalDosage 作 size 下限)", remain, size)
+	}
+	// used = TotalDosage(3000) - remain(1500) = 1500。
+	if used != 1500 {
+		t.Errorf("used=%d want 1500", used)
+	}
+	if packs != 2 {
+		t.Errorf("packs=%d want 2", packs)
+	}
+}
+
+// TestResourceSummaryGlobalRealm 断言 global 账号走 global billing base + /billing/meter/*
+// （无 /v2 前缀），且 404 时 fallback /v2——realm 感知双路径，供 cmd/credit 复用。
+func TestResourceSummaryGlobalRealm(t *testing.T) {
+	var billingCalls []string
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		billingCalls = append(billingCalls, r.URL.Path)
+		if r.URL.Path == "/billing/meter/get-user-resource" {
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"PackageName":"g","CycleCapacitySize":500,"CycleCapacityRemain":200,"CycleCapacityUsed":300}
+		]}}}}`))
+	}))
+	defer billSrv.Close()
+
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	c := &Client{
+		HTTP:              &http.Client{},
+		BillingBaseCN:     "https://billing.cn",
+		BillingBaseGlobal: strings.TrimSuffix(billSrv.URL, "/"),
+		GlobalEnabled:     true,
+	}
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	remain, used, size, packs, err := c.ResourceSummary(a)
+	if err != nil {
+		t.Fatalf("global summary: %v", err)
+	}
+	if remain != 200 || used != 300 || size != 500 || packs != 1 {
+		t.Errorf("global summary=%d/%d/%d/%d want 200/300/500/1", remain, used, size, packs)
+	}
+	if len(billingCalls) != 2 ||
+		billingCalls[0] != "/billing/meter/get-user-resource" ||
+		billingCalls[1] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("global billing fallback calls=%v", billingCalls)
+	}
+}
+
+// TestResourceSummaryCNUnchanged 零回归：CN 账号仍是 /v2/billing/meter/get-user-resource 单路径。
+func TestResourceSummaryCNUnchanged(t *testing.T) {
+	var calls []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls = append(calls, r.URL.Path)
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	_, _, _, _, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"})
+	if err != nil {
+		t.Fatalf("cn summary: %v", err)
+	}
+	if len(calls) != 1 || calls[0] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("cn billing calls=%v want single /v2 path", calls)
 	}
 }
 
@@ -484,7 +657,7 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -507,5 +680,40 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	})
 	if c.chatHTTP() != c.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
+	}
+}
+
+// TestRateRegexesPrecompiledConcurrent 正则预编译为包级 var 后（P2-9，发现 8），
+// 两个限流判定函数在高并发下结果恒定。旧实现（函数体内 MustCompile）在此
+// 测试下同样通过（纯只读），该测试锁的是「预编译不改变语义」+ 并发安全，
+// 防止未来有人把包级 var 改回带状态的调用侧编译。
+func TestRateRegexesPrecompiledConcurrent(t *testing.T) {
+	const bodies = 50
+	const workers = 8
+	rlBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+	resetBody := `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < bodies; i++ {
+				if !IsModelRateLimit(rlBody) {
+					errs <- fmt.Errorf("IsModelRateLimit concurrent miss")
+					return
+				}
+				if _, ok := ParseRateReset(resetBody); !ok {
+					errs <- fmt.Errorf("ParseRateReset concurrent miss")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }

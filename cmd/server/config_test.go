@@ -289,6 +289,16 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
+			c.Schedule.SchoolEnabled, c.Schedule.CatEnabled)
+	}
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
@@ -316,6 +326,15 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	}
+	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
+		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
+	}
+	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
+		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
+	}
+	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
+		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
 	}
 }
 
@@ -549,17 +568,17 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultCustom 默认 prompt.mode=custom 且 PromptText 为内置默认（非空）。
-func TestPromptDefaultCustom(t *testing.T) {
+// TestPromptDefaultMode 默认 prompt.mode=passthrough 且不加载 PromptText（透传客户端原始 system）。
+func TestPromptDefaultMode(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("prompt.mode=%q want custom", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText == "" {
-		t.Error("PromptText should be non-empty (built-in default)")
+	if c.PromptText != "" {
+		t.Errorf("default passthrough should not load PromptText, got len=%d", len(c.PromptText))
 	}
 }
 
@@ -607,7 +626,9 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+pf+`"}}`), 0o600)
+	// 路径写进 JSON 字符串需转义反斜杠：Windows 下 filepath.Join 生成 C:\Users\...，
+	// 原样拼接会让 \U 成为非法 JSON 转义。ToSlash 统一为正斜杠（跨平台可解析）。
+	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -629,7 +650,7 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 仍 custom。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 走缺省 passthrough。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -638,11 +659,40 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Prompt.Mode != "custom" {
-		t.Errorf("legacy config should default to custom, got %q", c.Prompt.Mode)
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)
+	}
+}
+
+// TestUpstreamVersionConfig 配置 upstream.client_version / cli_version 与 env
+// WB2A_CLIENT_VERSION / WB2A_CLI_VERSION 均生效；缺省空串 = headers 层回落内置默认。
+func TestUpstreamVersionConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"client_version":"6.0.0","cli_version":"3.0.0"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.ClientVersion != "6.0.0" || c.Upstream.CliVersion != "3.0.0" {
+		t.Errorf("client_version=%q cli_version=%q want 6.0.0/3.0.0", c.Upstream.ClientVersion, c.Upstream.CliVersion)
+	}
+	// 缺省为空（headers 层回落内置默认）。
+	if c2, err := Load(""); err != nil || c2.Upstream.ClientVersion != "" || c2.Upstream.CliVersion != "" {
+		t.Errorf("default versions=%q/%q want empty (err=%v)", c2.Upstream.ClientVersion, c2.Upstream.CliVersion, err)
+	}
+	// env 覆盖。
+	t.Setenv("WB2A_CLIENT_VERSION", "7.0.0")
+	t.Setenv("WB2A_CLI_VERSION", "4.0.0")
+	c3, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Upstream.ClientVersion != "7.0.0" || c3.Upstream.CliVersion != "4.0.0" {
+		t.Errorf("env versions=%q/%q want 7.0.0/4.0.0", c3.Upstream.ClientVersion, c3.Upstream.CliVersion)
 	}
 }
 

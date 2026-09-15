@@ -1,4 +1,4 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive 四类独立排程。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
 // 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
 package scheduler
 
@@ -18,7 +18,7 @@ import (
 
 // Config 调度器依赖。
 //
-// 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
+// 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
@@ -27,9 +27,16 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
+	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
+	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
+
+	// ExpiringSoonWindow 快过期积分窗口：签到查余额时，把到期时间 <= now+window 的
+	// 套餐余额标记为"快过期"（pool 据此优先消耗，见 entry.creditsExpiring）。
+	// <=0 时禁用分桶（全部归长期，行为与引入前一致）。默认建议 7*24h。
+	ExpiringSoonWindow time.Duration
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
@@ -40,6 +47,10 @@ type Config struct {
 	ActivityDisabled bool
 	// KeepaliveDisabled 显式关闭 token 保活排程（schedule.keepalive_enabled=false）。
 	KeepaliveDisabled bool
+	// SchoolDisabled 显式关闭开学季任务排程（schedule.school_enabled=false）。
+	SchoolDisabled bool
+	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
+	CatDisabled bool
 }
 
 // Scheduler 调度器。
@@ -69,6 +80,12 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{22}
 	}
+	if len(cfg.SchoolHours) == 0 {
+		cfg.SchoolHours = []int{12}
+	}
+	if len(cfg.CatHours) == 0 {
+		cfg.CatHours = []int{1}
+	}
 	// 0/缺省 = 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
@@ -92,11 +109,11 @@ const (
 
 // CheckinOutcome 单账号签到结果（供手动签到回执与日志汇总）。
 type CheckinOutcome struct {
-	UID      string         `json:"uid"`
-	Nickname string         `json:"nickname,omitempty"`
-	Status   CheckinStatus  `json:"status"`
-	Credits  *int64         `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
-	Detail   string         `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
+	UID      string        `json:"uid"`
+	Nickname string        `json:"nickname,omitempty"`
+	Status   CheckinStatus `json:"status"`
+	Credits  *int64        `json:"credits,omitempty"` // 签到后余额（余额查询成功才有值）
+	Detail   string        `json:"detail,omitempty"`  // 失败/跳过原因（"已签到"不填）
 }
 
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
@@ -125,6 +142,8 @@ const (
 	taskTravel
 	taskActivity
 	taskKeepalive
+	taskSchool
+	taskCat
 )
 
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
@@ -147,6 +166,12 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	}
 	if !s.cfg.KeepaliveDisabled {
 		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+	}
+	if !s.cfg.SchoolDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
+	}
+	if !s.cfg.CatDisabled {
+		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -174,7 +199,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
-			// 四类任务全部禁用：不空转，只等退出信号。
+			// 六类任务全部禁用：不空转，只等退出信号。
 			<-ctx.Done()
 			return
 		}
@@ -185,19 +210,46 @@ func (s *Scheduler) Run(ctx context.Context) {
 			return
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
-			for _, k := range kinds {
-				switch k {
-				case taskCheckin:
-					s.RunCheckinNow()
-				case taskTravel:
-					s.RunTravelNow()
-				case taskActivity:
-					s.RunActivityNow()
-				case taskKeepalive:
-					s.RunKeepaliveNow()
-				}
-			}
+			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
+			// 54 号 × 5 条 ≈ 7-8 分钟睡眠）不再阻塞同槽其他任务族；返回前
+			// 等全部任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠
+			// 的风险与串行版相同——nextWake 只挑现在之后的时点）。
+			s.runBatch(ctx, kinds)
 		}
+	}
+}
+
+// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
+func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	var wg sync.WaitGroup
+	for _, k := range kinds {
+		wg.Add(1)
+		go func(k taskKind) {
+			defer wg.Done()
+			s.dispatch(ctx, k)
+		}(k)
+	}
+	wg.Wait()
+}
+
+// dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
+// 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
+// ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
+func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+	switch k {
+	case taskCheckin:
+		s.RunCheckinNow()
+	case taskTravel:
+		s.runTravel(ctx)
+	case taskActivity:
+		s.runActivity(ctx)
+	case taskKeepalive:
+		s.RunKeepaliveNow()
+	case taskSchool:
+		s.RunSchoolNow()
+	case taskCat:
+		s.RunCatNow()
 	}
 }
 
@@ -238,6 +290,15 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			out = append(out, oc)
 			continue
 		}
+		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
+		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+		if a.IsGlobal() {
+			oc.Status, oc.Detail = CheckinSkipped, "global"
+			skipN++
+			out = append(out, oc)
+			continue
+		}
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
@@ -256,9 +317,12 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 					out = append(out, oc)
 					continue
 				}
-			} else if err := a.SaveAtomic(); err != nil {
-				// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
-				log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+			} else {
+				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+				if err := a.SaveAtomic(); err != nil {
+					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
+					log.Printf("checkin %s save: %v", logfmt.UID8(st.UID), err)
+				}
 			}
 		}
 		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
@@ -275,7 +339,9 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		} else {
 			oc.Status = CheckinOK
 		}
-		remain, err := s.cfg.Upstream.UserResource(a)
+		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗（issue:积分过期）。
+		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
+		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.UID8(st.UID), err)
 			oc.Status = CheckinFail
@@ -285,6 +351,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
 		oc.Credits = &remain
 		switch oc.Status {
 		case CheckinOK:
@@ -311,6 +378,8 @@ func joinDetail(existing, add string) string {
 
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报。
 // 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
+// CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 可用）；单账号失败
+// 只记 WARN 不影响遍历。
 //
 // 每号上报 N 条（ActivityReportCount，默认 5）：N 条共用同一 conversationId
 // （wb2api-<ms>），模拟同一会话内 N 轮对话——这是领养猫（buddy/first）对话量
@@ -323,7 +392,15 @@ func joinDetail(existing, add string) string {
 // ② 无猫账号立即重试领养（travelAdoptForce）——对话量刚补满的新状态，不算重试，
 // 豁免 adoptTriedToday 当日防抖（旅行排程 09 点已领养过且 skip，10 点上报补满后
 // 不能依赖下一轮旅行领养，就地闭环）。
+// RunActivityNow 立即对池内所有可用账号执行对话活跃上报（无 ctx 的外部入口：
+// cmd/activity 一次性触发、测试）。内部走 runActivity，取背景 ctx（不可取消，
+// 语义与引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunActivityNow() {
+	s.runActivity(context.Background())
+}
+
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。
+func (s *Scheduler) runActivity(ctx context.Context) {
 	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
@@ -334,8 +411,13 @@ func (s *Scheduler) RunActivityNow() {
 		if a == nil || a.AccessToken == "" {
 			continue
 		}
+		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
+		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
+		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
-			time.Sleep(activityAccountDelay)
+			if !sleepCtx(ctx, activityAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+			}
 		}
 		first = false
 		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
@@ -350,7 +432,10 @@ func (s *Scheduler) RunActivityNow() {
 			log.Printf("activity %s: report %d/%d ok", logfmt.UID8(a.UID), i, count)
 			ok++
 			if i < count {
-				time.Sleep(activityReportGap) // 账号内 5 条之间间隔，避免秒发风控
+				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
+				if !sleepCtx(ctx, activityReportGap) {
+					return
+				}
 			}
 		}
 		if ok < count {
@@ -406,6 +491,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.UID8(st.UID), err)
 		}

@@ -8,18 +8,33 @@
   - chat 域（copilot.tencent.com）：growth / tasks / buddy / streak / chat/completions
   - billing 域（www.codebuddy.cn）：/v2/report
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
-  - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
 """
 import json, os, time, glob, urllib.request, urllib.error
 
-AUTHS = "/root/workbuddy2api/auths"
+
+def _resolve_auths_dir() -> str:
+    """解析 auths 凭证目录：WB2A_AUTHS > 仓库根 auths/ > /root/workbuddy2api/auths 兜底。
+
+    env 显式覆盖最优先；本地仓库 auths/ 按 __file__ 自定位（脚本位于 scripts/ 下，
+    仓库根为其上两级），非 Linux 部署（auth 不在 /root/workbuddy2api）自动回落
+    本地 auths/；兜底保持 Linux 服务器行为不变。
+    """
+    env = os.environ.get("WB2A_AUTHS")
+    if env:
+        return env
+    local = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "auths")
+    if os.path.isdir(local):
+        return local
+    return "/root/workbuddy2api/auths"
+
+
+AUTHS = _resolve_auths_dir()
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
 BILL_BASE = "https://www.codebuddy.cn"      # report / billing
 
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
 PATH_ACCEPT_TASKS   = "/v2/activity/growth/tasks/accept"
-PATH_CLAIM_REWARD   = "/v2/activity/growth/tasks/reward/claim"
 PATH_BUDDY_FIRST    = "/activity/growth/buddy/first"
 PATH_BUDDY_AGREEMENT = "/activity/growth/buddy/agreement"
 PATH_STREAK         = "/activity/growth/streak"
@@ -32,7 +47,9 @@ CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2"
 def load_auth(uid_or_file: str) -> dict:
     """从 auths/ 加载账号凭证，uid_or_file 为 uid 前缀或 auths 文件名。
 
-    返回 {token, uid, domain, nick, file} 五元组。
+    返回 {token, uid, domain, nick, file, realm} 六元组。
+    realm 读取兼容嵌套形（`auth.realm`，login.sh --realm=global 落盘形态）与
+    扁平形（顶层 `realm`）；两种都缺省 → "cn"（老 CN 凭证零回归）。
     """
     if os.path.sep in uid_or_file or uid_or_file.endswith(".json"):
         p = uid_or_file
@@ -44,11 +61,28 @@ def load_auth(uid_or_file: str) -> dict:
         if not hits:
             raise SystemExit(f"no auth for {pre}")
         p = hits[0]
-    d = json.load(open(p))
+    # encoding="utf-8" 必须显式指定：Windows 上 open() 默认用 locale 代码页
+    # （中文系统为 GBK），而 auth 文件是 UTF-8 写入的，非 ASCII 昵称会触发
+    # UnicodeDecodeError，使所有脚本类任务（school/cat/trial 等）直接中断。
+    d = json.load(open(p, encoding="utf-8"))
     a, acc = d["auth"], d["account"]
+    realm = a.get("realm") or d.get("realm") or ""
     return {"token": a["accessToken"], "domain": a.get("domain") or "",
             "uid": acc["uid"], "nick": acc.get("nickname", ""),
-            "file": os.path.basename(p)}
+            "file": os.path.basename(p), "realm": realm}
+
+
+def auth_is_global(auth: dict) -> bool:
+    """判定账号是否属于 global realm：realm==global 或 domain 后缀 .workbuddy.ai。
+
+    与 Go auth.Realm() 的判定口径一致（显式 realm 优先于 domain 回落）。
+    供 CN-only 任务脚本跳过 global 账号、明确提示，避免把 global token 打向
+    copilot.tencent.com/codebuddy.cn（全球版无任务中心，打 CN 端点属错误行为）。
+    """
+    if (auth.get("realm") or "").strip().lower() == "global":
+        return True
+    d = (auth.get("domain") or "").strip().lower()
+    return d == "workbuddy.ai" or d.endswith(".workbuddy.ai")
 
 
 def chat_base(auth: dict) -> str:
@@ -124,12 +158,6 @@ def accept_tasks(auth, task_codes) -> tuple:
     """POST accept 任务（not_accepted → accepted）。返回 (status, resp)。"""
     return do_post(auth, chat_base(auth), PATH_ACCEPT_TASKS,
                    {"task_codes": task_codes})
-
-
-def claim_reward(auth, task_code) -> tuple:
-    """POST claim 领取奖励（任务已 complete 后可领）。重复领返回业务错误，安全。"""
-    return do_post(auth, chat_base(auth), PATH_CLAIM_REWARD,
-                   {"task_code": task_code})
 
 
 def get_streak(auth) -> int:
